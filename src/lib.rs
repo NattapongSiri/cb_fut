@@ -72,6 +72,55 @@ macro_rules! once {
     };
 }
 
+/// Turn a function call that take a single callback function to return a value
+/// then wait for callback to return another value to continue it execution into a function
+/// that return a `Future` which resolve to a struct that is `Deref` into a result and
+/// it will automatically return value to a function when it is dropped. 
+/// 
+/// This macro can be used when the function invoke a callback only once to return a value.
+/// If the callback will be called multiple times, use macro 
+/// [stream_blocked](macro.stream_blocked.html) instead.
+/// 
+/// The function call signature need to have a placeholder for macro to identify a callback
+/// parameter. To make it reflect to typical Rust syntax, the callback placeholder is
+/// `->(a)->control_value` for a callback that take single parameter and return 
+/// `control_value` as default callback return value. The reason to choose `(a)` instead of
+/// `|a|` is because the return Future from this macro will return a struct that
+/// can be `Deref` into `(a)` tuple thus `->(a)` just like regular function return signature 
+/// but with identifier instead of type.
+/// The `control_value` can be any valid Rust expression.
+/// 
+/// Example simple usage:
+/// ```rust
+/// fn func(v: i32, cb: impl FnOnce(i32, i32)->i32) {
+///    std::thread::sleep(std::time::Duration::from_secs(2));
+///    let controlled_value = cb(v, v * 2);
+///    assert_eq!(controlled_value, 0i32);
+///    dbg!(controlled_value);
+/// }
+/// 
+/// // After the returned value goes out of scope, it'll print 0 on console.
+/// let (a, b) = *futures::executor::block_on(cb_fut::once_blocked!(func(2 + 3, ->(a, b)->0i32)));
+/// assert_eq!(5, a);
+/// assert_eq!(10, b);
+/// ```
+/// 
+/// Example of returning a value:
+/// ```rust
+/// fn func(v: i32, cb: impl FnOnce(i32, i32)->i32) {
+///    std::thread::sleep(std::time::Duration::from_secs(2));
+///    let controlled_value = cb(v, v * 2);
+///    assert_eq!(controlled_value, 3i32);
+///    dbg!(controlled_value);
+/// }
+/// 
+/// let mut ret = futures::executor::block_on(cb_fut::once_blocked!(func(2 + 3, ->(a, b)->0i32)));
+/// // It will print 3 instead of 0 in the console.
+/// ret.return_value(3);
+/// let (a, b) = *ret;
+/// assert_eq!(5, a);
+/// assert_eq!(10, b);
+/// ```
 #[macro_export]
 macro_rules! once_blocked {
     // Typical callback style is to be a last parameter.
