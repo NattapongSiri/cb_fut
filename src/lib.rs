@@ -14,6 +14,22 @@
 use futures::task::{Context, Poll};
 use std::pin::Pin;
 
+#[cfg(not(feature="crossbeam"))]
+pub fn channel<T>() -> (std::sync::mpsc::Sender<T>, std::sync::mpsc::Receiver<T>) {
+    std::sync::mpsc::channel()
+}
+
+#[cfg(feature="crossbeam")]
+pub fn channel<T>() -> (crossbeam_channel::Sender<T>, crossbeam_channel::Receiver<T>) {
+    crossbeam_channel::unbounded()
+}
+
+#[cfg(not(feature="crossbeam"))]
+type Sender<T> = std::sync::mpsc::Sender<T>;
+
+#[cfg(feature="crossbeam")]
+type Sender<T> = crossbeam_channel::Sender<T>;
+
 /// Turn a function call that take a single callback function and return nothing into a function call
 /// without callback that return a future value.
 /// 
@@ -43,7 +59,7 @@ macro_rules! once {
     // Typical callback style is to be last parameter. 
     ($func_name: ident($($params: expr),*, ->($($c_params: ident),*))) => {
         (|| {
-            let (sender, receiver) = std::sync::mpsc::channel();
+            let (sender, receiver) = $crate::channel();
             $func_name($($params),*, move |$($c_params),*| {sender.send(($($c_params),*)).unwrap()});
             return async move {
                 receiver.recv().unwrap()
@@ -53,7 +69,7 @@ macro_rules! once {
     // Callback as first parameter of function. This is similar to setTimeout() in javascript.
     ($func_name: ident(->($($c_params: ident),*), $($params: expr),*)) => {
         (|| {
-            let (sender, receiver) = std::sync::mpsc::channel();
+            let (sender, receiver) = $crate::channel();
             $func_name(move |$($c_params),*| {sender.send(($($c_params),*)).unwrap()}, $($params),*);
             return async move {
                 receiver.recv().unwrap()
@@ -63,7 +79,7 @@ macro_rules! once {
     // Callback in the middle between other parameters of function. 
     ($func_name: ident($($params: expr),+, ->($($c_params: ident),*), $($more_params: expr),+)) => {
         (|| {
-            let (sender, receiver) = std::sync::mpsc::channel();
+            let (sender, receiver) = $crate::channel();
             $func_name($($params),*, move |$($c_params),*| {sender.send(($($c_params),*)).unwrap()}, $($more_params),*);
             return async move {
                 receiver.recv().unwrap()
@@ -126,8 +142,8 @@ macro_rules! once_blocked {
     // Typical callback style is to be a last parameter.
     ($func_name: ident($($params: expr),*, ->($($c_params: ident),*)->$c_ret: expr)) => {
         (|| {
-            let (sender, receiver) = futures::channel::oneshot::channel();
-            let (ret_sender, ret_receiver) = std::sync::mpsc::channel();
+            let (sender, receiver) = $crate::channel();
+            let (ret_sender, ret_receiver) = $crate::channel();
             let default_ret_sender = ret_sender.clone();
             let thread_handle = std::thread::spawn(move || {
                 $func_name($($params),*, move |$($c_params),*| {
@@ -136,12 +152,12 @@ macro_rules! once_blocked {
                 })
             });
             return async move {
-                let ($($c_params),*) = receiver.await.unwrap();
+                let ($($c_params),*) = receiver.recv().unwrap();
                 return $crate::CBBlockResult::new(
                     ($($c_params),*),
                     move |val| {ret_sender.send(val).unwrap()},
                     move || {default_ret_sender.send($c_ret).unwrap();},
-                    thread_handle
+                    Some(thread_handle)
                 )
             };
             // return futures::select!(function = func => function, callback = cb => callback)
@@ -150,8 +166,8 @@ macro_rules! once_blocked {
     // Callback as first parameter of function. This is similar to setTimeout() in javascript.
     ($func_name: ident(->($($c_params: ident),*)->$c_ret: expr, $($params: expr),*)) => {
         (|| {
-            let (sender, receiver) = futures::channel::oneshot::channel();
-            let (ret_sender, ret_receiver) = std::sync::mpsc::channel();
+            let (sender, receiver) = $crate::channel();
+            let (ret_sender, ret_receiver) = $crate::channel();
             let default_ret_sender = ret_sender.clone();
             let thread_handle = std::thread::spawn(move || {
                 $func_name(move |$($c_params),*| {
@@ -160,12 +176,12 @@ macro_rules! once_blocked {
                 }, $($params),*,)
             });
             return async move {
-                let ($($c_params),*) = receiver.await.unwrap();
+                let ($($c_params),*) = receiver.recv().unwrap();
                 return $crate::CBBlockResult::new(
                     ($($c_params),*),
                     move |val| {ret_sender.send(val).unwrap()},
                     move || {default_ret_sender.send($c_ret).unwrap();},
-                    thread_handle
+                    Some(thread_handle)
                 )
             };
         })()
@@ -173,8 +189,8 @@ macro_rules! once_blocked {
     // Callback in the middle between other parameters of function. 
     ($func_name: ident($($params: expr),+, ->($($c_params: ident),*)->$c_ret: expr, $($more_params: expr),+)) => {
         (|| {
-            let (sender, receiver) = futures::channel::oneshot::channel();
-            let (ret_sender, ret_receiver) = std::sync::mpsc::channel();
+            let (sender, receiver) = $crate::channel();
+            let (ret_sender, ret_receiver) = $crate::channel();
             let default_ret_sender = ret_sender.clone();
             let thread_handle = std::thread::spawn(move || {
                 $func_name($($params),*, move |$($c_params),*| {
@@ -183,12 +199,12 @@ macro_rules! once_blocked {
                 }, $($more_params),*,)
             });
             return async move {
-                let ($($c_params),*) = receiver.await.unwrap();
+                let ($($c_params),*) = receiver.recv().unwrap();
                 return $crate::CBBlockResult::new(
                     ($($c_params),*),
                     move |val| {ret_sender.send(val).unwrap()},
                     move || {default_ret_sender.send($c_ret).unwrap();},
-                    thread_handle
+                    Some(thread_handle)
                 )
             };
         })()
@@ -232,37 +248,128 @@ macro_rules! stream {
     // Typical callback style is to be last parameter. 
     ($func_name: ident($($params: expr),*, ->($($c_params: ident),*))) => {
         (|| {
-            let (sender, receiver) = std::sync::mpsc::channel();
-            $func_name($($params),*, move |$($c_params),*| {sender.send(($($c_params),*)).unwrap()});
+            let (sender, receiver) = futures::channel::mpsc::unbounded();
+            $func_name($($params),*, move |$($c_params),*| {sender.unbounded_send(($($c_params),*)).unwrap()});
             $crate::CBStream::new(receiver)
         })()
     };
     // Callback as first parameter of function. This is similar to setTimeout() in javascript.
     ($func_name: ident(->($($c_params: ident),*), $($params: expr),*)) => {
         (|| {
-            let (sender, receiver) = std::sync::mpsc::channel();
-            $func_name(move |$($c_params),*| {sender.send(($($c_params),*)).unwrap()}, $($params),*);
+            let (sender, receiver) = futures::channel::mpsc::unbounded();
+            $func_name(move |$($c_params),*| {sender.unbounded_send(($($c_params),*)).unwrap()}, $($params),*);
             $crate::CBStream::new(receiver)
         })()
     };
     // Callback in the middle between other parameters of function. 
     ($func_name: ident($($params: expr),+, ->($($c_params: ident),*), $($more_params: expr),+)) => {
         (|| {
-            let (sender, receiver) = std::sync::mpsc::channel();
-            $func_name($($params),*, move |$($c_params),*| {sender.send(($($c_params),*)).unwrap()}, $($more_params),*);
+            let (sender, receiver) = futures::channel::mpsc::unbounded();
+            $func_name($($params),*, move |$($c_params),*| {sender.unbounded_send(($($c_params),*)).unwrap()}, $($more_params),*);
             $crate::CBStream::new(receiver)
+        })()
+    };
+}
+
+/// Turn a function call that take a single callback and return nothing into a function call
+/// without callback but return an implementation of `futures::Stream` called 
+/// [CBStream](struct.CBStream.html).
+/// 
+/// If the callback will be called only once to return a value, consider using macro 
+/// [once](macro.once.html) instead.
+/// 
+/// The function call signature need to have a placeholder for macro to identify a callback
+/// parameter. To make it reflect to typical Rust syntax, the callback placeholder is
+/// `->(a)` for a callback that take single parameter. The reason to choose `(a)` instead of
+/// `|a|` is because the return Future from this macro will return a `(a)` tuple thus 
+/// `->(a)` just like regular function return signature but with identifier instead of type.
+/// 
+/// Example usecase:
+/// ```rust
+/// use futures::stream::StreamExt;
+/// fn func(u: i32, mut cb: impl FnMut(i32, i32), v: i32) {
+///     for i in 0..5 {
+///         cb(u + i, v * i)
+///     }
+/// }
+/// let mut counter = 0;
+/// 
+/// futures::executor::block_on(cb_fut::stream!(func(2 * 3, ->(a, b), 2 + 3)).enumerate().for_each(|(i, fut)| {
+///     counter += 1;
+///     async move {
+///         let (a, b) = fut;
+///         assert_eq!(2 * 3 + i as i32, a);
+///         assert_eq!((2 + 3) * i as i32, b);
+///     }
+/// }));
+/// ```
+#[macro_export]
+macro_rules! stream_blocked {
+    // Typical callback style is to be last parameter. 
+    ($func_name: ident($($params: expr),*, ->($($c_params: ident),*)->$c_ret: expr)) => {
+        (|| {
+            let (sender, receiver) = futures::channel::mpsc::unbounded();
+            let (ret_sender, ret_receiver) = $crate::channel();
+            std::thread::spawn(move || {
+                $func_name(
+                    $($params),*, 
+                    move |$($c_params),*| {
+                        sender.unbounded_send(($($c_params),*)).unwrap();
+                        let val = ret_receiver.recv().unwrap();
+                        val
+                    }
+                )
+            });
+            Box::new($crate::CBStreamBlocked::new(ret_sender, receiver, $c_ret))
+        })()
+    };
+    // Callback as first parameter of function. This is similar to setTimeout() in javascript.
+    ($func_name: ident(->($($c_params: ident),*)->$c_ret: expr, $($params: expr),*)) => {
+        (|| {
+            let (sender, receiver) = futures::channel::mpsc::unbounded();
+            let (ret_sender, ret_receiver) = $crate::channel();
+            std::thread::spawn(move || {
+                $func_name(
+                    move |$($c_params),*| {
+                        sender.unbounded_send(($($c_params),*)).unwrap();
+                        let val = ret_receiver.recv().unwrap();
+                        val
+                    },
+                    $($params),*
+                )
+            });
+            Box::new($crate::CBStreamBlocked::new(ret_sender, receiver, $c_ret))
+        })()
+    };
+    // Callback in the middle between other parameters of function. 
+    ($func_name: ident($($params: expr),+, ->($($c_params: ident),*)->$c_ret: expr, $($more_params: expr),+)) => {
+        (|| {
+            let (sender, receiver) = futures::channel::mpsc::unbounded();
+            let (ret_sender, ret_receiver) = $crate::channel();
+            std::thread::spawn(move || {
+                $func_name(
+                    $($params),*,
+                    move |$($c_params),*| {
+                        sender.unbounded_send(($($c_params),*)).unwrap();
+                        let val = ret_receiver.recv().unwrap();
+                        val
+                    },
+                    $($more_params),*
+                )
+            });
+            Box::new($crate::CBStreamBlocked::new(ret_sender, receiver, $c_ret))
         })()
     };
 }
 
 /// A represent of callback function arguments which implement `futures::Stream` trait.
 pub struct CBStream<T> {
-    data_receiver: std::sync::mpsc::Receiver<T>,
+    data_receiver: futures::channel::mpsc::UnboundedReceiver<T>,
     waker: Option<futures::task::Waker>
 }
 
 impl<T> CBStream<T> {
-    pub fn new(reciever: std::sync::mpsc::Receiver<T>) -> CBStream<T> {
+    pub fn new(reciever: futures::channel::mpsc::UnboundedReceiver<T>) -> CBStream<T> {
         CBStream {
             data_receiver: reciever,
             waker: None
@@ -274,18 +381,71 @@ impl<T> futures::Stream for CBStream<T> {
     type Item=T;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.data_receiver.try_recv() {
-            Ok(v) => Poll::Ready(Some(v)),
-            Err(e) => {
-                match e {
-                    std::sync::mpsc::TryRecvError::Empty => {
-                        self.waker = Some(cx.waker().clone());
-                        Poll::Pending
-                    },
-                    std::sync::mpsc::TryRecvError::Disconnected => {
-                        Poll::Ready(None)
-                    }
+        let data_receiver = &mut self.data_receiver;
+        futures::pin_mut!(data_receiver);
+        match data_receiver.poll_next(cx) {
+            Poll::Ready(v) => {
+                if let Some(v) = v {
+                    Poll::Ready(Some(v))
+                } else {
+                    Poll::Ready(None)
                 }
+            },
+            Poll::Pending => {
+                self.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        } 
+    }
+}
+
+/// A represent of callback function arguments which implement `futures::Stream` trait and return
+/// value to the function by using [CBBlockResult](struct.CBBlockResult.html).
+pub struct CBStreamBlocked<R, T> where R: 'static + Clone {
+    data_receiver: futures::channel::mpsc::UnboundedReceiver<T>,
+    ret_sender: crate::Sender<R>,
+    default_return_value: R,
+    waker: Option<futures::task::Waker>
+}
+
+impl<R, T> CBStreamBlocked<R, T> where R: 'static + Clone {
+    pub fn new(return_sender: crate::Sender<R>, reciever: futures::channel::mpsc::UnboundedReceiver<T>, default_ret_val: R) -> CBStreamBlocked<R, T> where R: 'static + Clone {
+        CBStreamBlocked {
+            data_receiver: reciever,
+            default_return_value: default_ret_val,
+            ret_sender: return_sender,
+            waker: None
+        }
+    }
+}
+
+impl<R, T> futures::Stream for Box<CBStreamBlocked<R, T>> where R: 'static + Clone {
+    type Item=CBBlockResult<R, T>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // use futures::Stream;
+        let data_receiver = &mut self.data_receiver;
+        futures::pin_mut!(data_receiver);
+        match data_receiver.poll_next(cx) {
+            Poll::Ready(v) => {
+                let ret_sender = self.ret_sender.clone();
+                let default_sender = ret_sender.clone();
+                let default_value = self.default_return_value.clone();
+                if let Some(v) = v {
+                    Poll::Ready(Some(
+                        CBBlockResult::new(
+                            v, 
+                            move |val| {ret_sender.send(val).unwrap()}, 
+                            move || default_sender.send(default_value).unwrap(), 
+                            None
+                        )
+                    ))
+                } else {
+                    Poll::Ready(None)
+                }
+            }, Poll::Pending => {
+                self.waker = Some(cx.waker().clone());
+                Poll::Pending
             }
         } 
     }
@@ -317,12 +477,12 @@ impl<R, T> core::ops::Deref for CBBlockResult<R, T> {
 }
 
 impl<R, T> CBBlockResult<R, T> where R: 'static {
-    pub fn new<F, FR>(result: T, caller_return_fn: FR, default_return: F, handle: std::thread::JoinHandle<()>) -> CBBlockResult<R, T> where F: 'static + FnOnce(), FR: 'static + FnOnce(R) {
+    pub fn new<F, FR>(result: T, caller_return_fn: FR, default_return: F, handle: Option<std::thread::JoinHandle<()>>) -> CBBlockResult<R, T> where F: 'static + FnOnce(), FR: 'static + FnOnce(R) {
         CBBlockResult {
             result,
             return_fn: Some(Box::new(caller_return_fn)),
             default_return: Some(Box::new(default_return)),
-            func_handle: Some(handle)
+            func_handle: handle
         }
     }
 
@@ -628,6 +788,76 @@ mod tests {
             async {}
         }));
 
+        assert_eq!(5, counter);
+    }
+
+    #[test]
+    fn test_stream_blocked_postfix() {
+        use futures::stream::StreamExt;
+        fn func(v: i32, mut cb: impl FnMut(i32, i32)->i32) {
+            for i in 0..5 {
+                cb(v, v * i);
+            }
+        }
+        let mut counter = 0;
+        
+        futures::executor::block_on(stream_blocked!(func(2 + 3, ->(a, b)->0i32)).enumerate().for_each(|(i, fut)| {
+            counter += 1;
+            async move {
+                let mut result = fut;
+                result.return_value(i as i32).unwrap();
+                let (a, b) = *result;
+                assert_eq!(5, a);
+                assert_eq!(5 * i as i32, b);
+            }
+        }));
+        assert_eq!(5, counter);
+    }
+
+    #[test]
+    fn test_stream_blocked_prefix() {
+        use futures::stream::StreamExt;
+        fn func(mut cb: impl FnMut(i32, i32)->i32, v: i32) {
+            for i in 0..5 {
+                cb(v, v * i);
+            }
+        }
+        let mut counter = 0;
+        
+        futures::executor::block_on(stream_blocked!(func(->(a, b)->0i32, 2 + 3)).enumerate().for_each(|(i, fut)| {
+            counter += 1;
+            async move {
+                let mut result = fut;
+                result.return_value(i as i32).unwrap();
+                let (a, b) = *result;
+                assert_eq!(5, a);
+                assert_eq!(5 * i as i32, b);
+            }
+        }));
+        assert_eq!(5, counter);
+    }
+
+    #[test]
+    fn test_stream_blocked_infix() {
+        use futures::stream::StreamExt;
+        fn func(u: i32, mut cb: impl FnMut(i32, i32)->i32, v: i32) {
+            let mut j = 0;
+            for _ in 0..5 {
+                j = cb(u + j, v * j);
+            }
+        }
+        let mut counter = 0;
+        
+        futures::executor::block_on(stream_blocked!(func(2, ->(a, b)->0i32, 2 + 3)).enumerate().for_each(|(i, fut)| {
+            counter += 1;
+            async move {
+                let mut result = fut;
+                result.return_value(i as i32 + 1i32).unwrap();
+                let (a, b) = *result;
+                assert_eq!(i as i32 + 2i32, a);
+                assert_eq!((3i32 + 2i32) * i as i32, b);
+            }
+        }));
         assert_eq!(5, counter);
     }
 }
