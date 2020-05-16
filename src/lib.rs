@@ -10,24 +10,43 @@
 //! - If the callback is not intended to return a value, don't use these two macros.
 //! - If the function also return value, the returned value will be silently dropped.
 //! - If the function take multiple callbacks to return value on different circumstance, don't use these two macros.
+//! 
+//! # What's new in version 0.2.0
+//! - [once_blocked](macro.once_blocked.html) - which let user return value to function.
+//! - [stream_blocked](macro.stream_blocked.html) - which let user return value to Stream.
+//! - By default, it will use Rust standard channel. Now it also support `Crossbeam-channel`.
+//! To use this feature, add features=["crossbeam"] to your `cargo.toml`. 
+//! For example: 
+//! ```toml
+//! [dependencies]
+//! cb_fut = {version = "^0.2", features = ["crossbeam"]}
+//! ```
 
 use futures::task::{Context, Poll};
 use std::pin::Pin;
 
 #[cfg(not(feature="crossbeam"))]
+/// Utility function intended to be used internally. It will return a channel regarding to feature gate.
+/// The default is to use standard channel.
 pub fn channel<T>() -> (std::sync::mpsc::Sender<T>, std::sync::mpsc::Receiver<T>) {
     std::sync::mpsc::channel()
 }
 
 #[cfg(feature="crossbeam")]
+/// Utility function intended to be used internally. It will return a channel regarding to feature gate.
+/// With "crossbeam" feature gate specified, it will return crossbeam channel.
 pub fn channel<T>() -> (crossbeam_channel::Sender<T>, crossbeam_channel::Receiver<T>) {
     crossbeam_channel::unbounded()
 }
 
 #[cfg(not(feature="crossbeam"))]
+/// Internal type alias to reflect feature gate specified by user.
+/// In this case, it is standard Sender from mpsc channel.
 type Sender<T> = std::sync::mpsc::Sender<T>;
 
 #[cfg(feature="crossbeam")]
+/// Internal type alias to reflect feature gate specified by user.
+/// In this case, it is crossbeam Sender crossbeam channel.
 type Sender<T> = crossbeam_channel::Sender<T>;
 
 /// Turn a function call that take a single callback function and return nothing into a function call
@@ -92,6 +111,9 @@ macro_rules! once {
 /// then wait for callback to return another value to continue it execution into a function
 /// that return a `Future` which resolve to a struct that is `Deref` into a result and
 /// it will automatically return value to a function when it is dropped. 
+/// 
+/// This macro will spawn a thread to execute the function while maintain the original
+/// thread to return a Future to caller.
 /// 
 /// This macro can be used when the function invoke a callback only once to return a value.
 /// If the callback will be called multiple times, use macro 
@@ -275,17 +297,21 @@ macro_rules! stream {
 /// without callback but return an implementation of `futures::Stream` called 
 /// [CBStreamBlocked](struct.CBStreamBlocked.html).
 /// 
+/// This macro will spawn a thread to execute the function while maintain the original
+/// thread to return a Future to caller.
+/// 
 /// If the callback will be called only once to return a value, consider using macro 
 /// [once](macro.once.html) or [once_blocked](macro.once_blocked.html) instead.
 /// 
 /// The function call signature need to have a placeholder for macro to identify a callback
 /// parameter. To make it reflect to typical Rust syntax, the callback placeholder is
-/// `->(a)->b` for a callback that take single parameter. The reason to choose `(a)` instead of
-/// `|a|` is because the return Future from this macro will return a `(a)` tuple thus 
-/// `->(a)` just like regular function return signature but with identifier instead of type.
-/// the extra `->b` designate the default return expression. It will be automatically call 
+/// `->(a)->b` for a callback that take single parameter and return some value. 
+/// The reason to choose `(a)` instead of `|a|` is because the return Future from 
+/// this macro will return a `(a)` tuple thus `->(a)` just like regular function return 
+/// signature but with identifier instead of type.
+/// The extra `->b` designate the default return expression. It will be automatically call 
 /// when the generated result is dropped. If caller want to return different value,
-/// it can be done by call method [return_value](struct.CBStreamBlocked.html#method.return_value).
+/// it can be done by call method [return_value](struct.CBBlockResult.html#method.return_value).
 /// It will prevent the default return from return value twice.
 /// 
 /// Example usecase:
@@ -405,8 +431,13 @@ impl<T> futures::Stream for CBStream<T> {
     }
 }
 
-/// A represent of callback function arguments which implement `futures::Stream` trait and return
+/// An object that represent callback function arguments. It implement `futures::Stream` trait and return
 /// value to the function by using [CBBlockResult](struct.CBBlockResult.html).
+/// 
+/// It can be obtain by using macro [stream_blocked](macro.stream_blocked!.html).
+/// See [stream_blocked](macro.stream_blocked!.html) for example usage.
+/// 
+/// This struct shall be semi-transparent to user.
 pub struct CBStreamBlocked<R, T> where R: 'static + Clone {
     data_receiver: futures::channel::mpsc::UnboundedReceiver<T>,
     ret_sender: crate::Sender<R>,
@@ -415,6 +446,10 @@ pub struct CBStreamBlocked<R, T> where R: 'static + Clone {
 }
 
 impl<R, T> CBStreamBlocked<R, T> where R: 'static + Clone {
+    /// You will likely use this macro [stream_blocked](macro.stream_blocked!.html) instead of
+    /// trying to construct this struct using this method.
+    /// 
+    /// It require channel to communicate back and forth between the function and this struct.
     pub fn new(return_sender: crate::Sender<R>, reciever: futures::channel::mpsc::UnboundedReceiver<T>, default_ret_val: R) -> CBStreamBlocked<R, T> where R: 'static + Clone {
         CBStreamBlocked {
             data_receiver: reciever,
@@ -457,7 +492,7 @@ impl<R, T> futures::Stream for Box<CBStreamBlocked<R, T>> where R: 'static + Clo
     }
 }
 
-/// It mean that the value already return once and caller attempt to return again.
+/// It mean that the value already return once and caller attempt to return something again.
 #[derive(Debug, PartialEq)]
 pub struct AlreadyReturnError;
 
@@ -467,6 +502,25 @@ impl std::fmt::Display for AlreadyReturnError {
     }
 }
 
+/// A structure that act as handle to retrieve result as well as return a value to function.
+/// 
+/// The struct implement `Deref` to let user get a direct access to result using tuple construct.
+/// For example, `result.0` to access first result.
+/// User can also using `Tuple` destructuring to get meaningful variable name such as
+/// `let (a, b) = *result`.
+/// 
+/// The struct let user return value via method [return_value](struct.CBBlockResult.html#method.return_value).
+/// It can be called only once. If user call it more than once, it will return Error 
+/// [AlreadyReturnError](struct.AlreadyReturnError.html)
+/// 
+/// The struct hold the default return value which will be used to return to value to function
+/// when it is dropped. However, calling [return_value](struct.CBBlockResult.html#method.return_value)
+/// once will prevent returning default value.
+/// 
+/// If the result is obtain from macro [once_blocked](macro.once_blocked!.html), when this result
+/// is dropped, it'll block current thread waiting until the function is completed.
+/// 
+/// If the result is obtain from `Stream` instance, it will never block.
 pub struct CBBlockResult<R, T> {
     result: T,
     return_fn: Option<Box<dyn FnOnce(R)>>,
@@ -474,6 +528,7 @@ pub struct CBBlockResult<R, T> {
     func_handle: Option<std::thread::JoinHandle<()>>
 }
 
+/// Get a reference to underlying result.
 impl<R, T> core::ops::Deref for CBBlockResult<R, T> {
     type Target=T;
 
@@ -483,6 +538,9 @@ impl<R, T> core::ops::Deref for CBBlockResult<R, T> {
 }
 
 impl<R, T> CBBlockResult<R, T> where R: 'static {
+    /// User shall never need to call this function.
+    /// Instead, user shall use macro, such as [once](macro.once_blocked!.html) to get a future
+    /// that resolve into this object.
     pub fn new<F, FR>(result: T, caller_return_fn: FR, default_return: F, handle: Option<std::thread::JoinHandle<()>>) -> CBBlockResult<R, T> where F: 'static + FnOnce(), FR: 'static + FnOnce(R) {
         CBBlockResult {
             result,
@@ -505,7 +563,7 @@ impl<R, T> CBBlockResult<R, T> where R: 'static {
     }
 }
 
-/// Implement `Drop` to return the default control value to original function.
+/// Implement `Drop` to return the default control variable to original function is run to complete.
 impl<R, T> Drop for CBBlockResult<R, T> {
     fn drop(&mut self) {
         if self.default_return.is_some() {
