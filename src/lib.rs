@@ -72,6 +72,80 @@ macro_rules! once {
     };
 }
 
+#[macro_export]
+macro_rules! once_blocked {
+    // Typical callback style is to be a last parameter.
+    ($func_name: ident($($params: expr),*, ->($($c_params: ident),*)->$c_ret: expr)) => {
+        (|| {
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            let (ret_sender, ret_receiver) = std::sync::mpsc::channel();
+            let default_ret_sender = ret_sender.clone();
+            let thread_handle = std::thread::spawn(move || {
+                $func_name($($params),*, move |$($c_params),*| {
+                    sender.send(($($c_params),*)).unwrap();
+                    ret_receiver.recv().unwrap()
+                })
+            });
+            return async move {
+                let ($($c_params),*) = receiver.await.unwrap();
+                return $crate::CBBlockResult::new(
+                    ($($c_params),*),
+                    move |val| {ret_sender.send(val).unwrap()},
+                    move || {default_ret_sender.send($c_ret).unwrap();},
+                    thread_handle
+                )
+            };
+            // return futures::select!(function = func => function, callback = cb => callback)
+        })()
+    };
+    // Callback as first parameter of function. This is similar to setTimeout() in javascript.
+    ($func_name: ident(->($($c_params: ident),*)->$c_ret: expr, $($params: expr),*)) => {
+        (|| {
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            let (ret_sender, ret_receiver) = std::sync::mpsc::channel();
+            let default_ret_sender = ret_sender.clone();
+            let thread_handle = std::thread::spawn(move || {
+                $func_name(move |$($c_params),*| {
+                    sender.send(($($c_params),*)).unwrap();
+                    ret_receiver.recv().unwrap()
+                }, $($params),*,)
+            });
+            return async move {
+                let ($($c_params),*) = receiver.await.unwrap();
+                return $crate::CBBlockResult::new(
+                    ($($c_params),*),
+                    move |val| {ret_sender.send(val).unwrap()},
+                    move || {default_ret_sender.send($c_ret).unwrap();},
+                    thread_handle
+                )
+            };
+        })()
+    };
+    // Callback in the middle between other parameters of function. 
+    ($func_name: ident($($params: expr),+, ->($($c_params: ident),*)->$c_ret: expr, $($more_params: expr),+)) => {
+        (|| {
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            let (ret_sender, ret_receiver) = std::sync::mpsc::channel();
+            let default_ret_sender = ret_sender.clone();
+            let thread_handle = std::thread::spawn(move || {
+                $func_name($($params),*, move |$($c_params),*| {
+                    sender.send(($($c_params),*)).unwrap();
+                    ret_receiver.recv().unwrap()
+                }, $($more_params),*,)
+            });
+            return async move {
+                let ($($c_params),*) = receiver.await.unwrap();
+                return $crate::CBBlockResult::new(
+                    ($($c_params),*),
+                    move |val| {ret_sender.send(val).unwrap()},
+                    move || {default_ret_sender.send($c_ret).unwrap();},
+                    thread_handle
+                )
+            };
+        })()
+    };
+}
+
 /// Turn a function call that take a single callback and return nothing into a function call
 /// without callback but return an implementation of `futures::Stream` called 
 /// [CBStream](struct.CBStream.html).
@@ -168,6 +242,70 @@ impl<T> futures::Stream for CBStream<T> {
     }
 }
 
+/// It mean that the value already return once and caller attempt to return again.
+#[derive(Debug, PartialEq)]
+pub struct AlreadyReturnError;
+
+impl std::fmt::Display for AlreadyReturnError {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+        writeln!(fmt, "The caller has already return a value. It shall not return other value.")
+    }
+}
+
+pub struct CBBlockResult<R, T> {
+    result: T,
+    return_fn: Option<Box<dyn FnOnce(R)>>,
+    default_return: Option<Box<dyn FnOnce()>>,
+    func_handle: Option<std::thread::JoinHandle<()>>
+}
+
+impl<R, T> core::ops::Deref for CBBlockResult<R, T> {
+    type Target=T;
+
+    fn deref(&self) -> &T {
+        &self.result
+    }
+}
+
+impl<R, T> CBBlockResult<R, T> where R: 'static {
+    pub fn new<F, FR>(result: T, caller_return_fn: FR, default_return: F, handle: std::thread::JoinHandle<()>) -> CBBlockResult<R, T> where F: 'static + FnOnce(), FR: 'static + FnOnce(R) {
+        CBBlockResult {
+            result,
+            return_fn: Some(Box::new(caller_return_fn)),
+            default_return: Some(Box::new(default_return)),
+            func_handle: Some(handle)
+        }
+    }
+
+    /// Return a value to the function and cancel out the default return value.
+    pub fn return_value(&mut self, value: R) -> Result<(), AlreadyReturnError> {
+        if self.return_fn.is_some() && self.default_return.is_some() {
+            self.default_return.take();
+            let ret_fn = self.return_fn.take().unwrap();
+            (ret_fn)(value);
+            Ok(())
+        } else {
+            Err(AlreadyReturnError)
+        }
+    }
+}
+
+/// Implement `Drop` to return the default control value to original function.
+impl<R, T> Drop for CBBlockResult<R, T> {
+    fn drop(&mut self) {
+        if self.default_return.is_some() {
+            let default_return = self.default_return.take().unwrap();
+            (default_return)();
+        }
+
+        if self.func_handle.is_some() {
+            // ensure that the thread is gracefully shutdown 
+            let func_handle = self.func_handle.take().unwrap();
+            func_handle.join().unwrap();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -210,6 +348,154 @@ mod tests {
             cb()
         }
         futures::executor::block_on(once!(func(2 + 3, -> ())));
+    }
+
+    #[test]
+    fn test_once_blocked_postfix() {
+        fn func(v: i32, cb: impl FnOnce(i32, i32) -> i32) {
+            if cb(v, v * 2) == 0i32 {
+                dbg!("Ok !");
+            } else {
+                panic!("Something wrong")
+            }
+        }
+        let mut ret = futures::executor::block_on(once_blocked!(func(2 + 3, ->(a, b) -> 0i32)));
+        let (a, b) = *ret;
+        assert_eq!(5, a);
+        assert_eq!(10, b);
+        ret.return_value(0).unwrap();
+    }
+
+    #[test]
+    fn test_once_blocked_default_postfix() {
+        fn func(v: i32, cb: impl FnOnce(i32, i32) -> i32) {
+            if cb(v, v * 2) == 0i32 {
+                dbg!("Ok !");
+            } else {
+                dbg!("Default shutdown..");
+            }
+        }
+        let ret = futures::executor::block_on(once_blocked!(func(2 + 3, ->(a, b) -> 1i32)));
+        let (a, b) = *ret;
+        assert_eq!(5, a);
+        assert_eq!(10, b);
+    }
+
+    #[test]
+    fn test_once_blocked_default_postfix_no_args() {
+        fn func(_v: i32, cb: impl FnOnce() -> i32) {
+            if cb() == 3i32 {
+                dbg!("Ok !");
+            } else {
+                panic!("Invalid return value")
+            }
+        }
+        futures::executor::block_on(once_blocked!(func(2 + 3, ->() -> {3i32})));
+    }
+
+    #[test]
+    fn test_once_blocked_postfix_with_logic() {
+        fn func(v: i32, cb: impl FnOnce(i32, i32) -> i32) {
+            if cb(v, v * 2) == 0i32 {
+                dbg!("Ok !");
+            } else {
+                panic!("Something wrong")
+            }
+        }
+        let mut ret = futures::executor::block_on(once_blocked!(func(2 + 3, ->(a, b) -> 0i32)));
+        let (a, b) = *ret;
+        assert_eq!(5, a);
+        assert_eq!(10, b);
+        if a + b == 15 && a * b == 50 {
+            ret.return_value(0).unwrap();
+        }
+        assert_eq!(ret.return_value(0).unwrap_err(), super::AlreadyReturnError);
+    }
+
+    #[test]
+    fn test_once_blocked_prefix() {
+        fn func(cb: impl FnOnce(i32, i32) -> i32, v: i32) {
+            if cb(v, v * 2) == 0i32 {
+                dbg!("Ok !");
+            } else {
+                panic!("Something wrong")
+            }
+        }
+        let mut ret = futures::executor::block_on(once_blocked!(func(->(a, b) -> 0i32, 2 + 3)));
+        let (a, b) = *ret;
+        assert_eq!(5, a);
+        assert_eq!(10, b);
+        ret.return_value(0).unwrap();
+    }
+
+    #[test]
+    fn test_once_blocked_default_prefix() {
+        fn func(cb: impl FnOnce(i32, i32) -> i32, v: i32) {
+            if cb(v, v * 2) == 0i32 {
+                dbg!("Ok !");
+            } else {
+                dbg!("Default shutdown..");
+            }
+        }
+        let ret = futures::executor::block_on(once_blocked!(func(->(a, b) -> 1i32, 2 + 3)));
+        let (a, b) = *ret;
+        assert_eq!(5, a);
+        assert_eq!(10, b);
+    }
+
+    #[test]
+    fn test_once_blocked_default_prefix_no_args() {
+        fn func(cb: impl FnOnce() -> i32, _v: i32) {
+            if cb() == 3i32 {
+                dbg!("Ok !");
+            } else {
+                panic!("Invalid return value")
+            }
+        }
+        futures::executor::block_on(once_blocked!(func(->() -> {3i32}, 2 + 3)));
+    }
+
+    #[test]
+    fn test_once_blocked_infix() {
+        fn func(u: i32, cb: impl FnOnce(i32, i32) -> i32, v: i32) {
+            if cb(u + v, u * v) == 0i32 {
+                dbg!("Ok !");
+            } else {
+                panic!("Something wrong")
+            }
+        }
+        let mut ret = futures::executor::block_on(once_blocked!(func(2i32, ->(a, b) -> 0i32, 2 + 3)));
+        let (a, b) = *ret;
+        assert_eq!(7, a);
+        assert_eq!(10, b);
+        ret.return_value(0).unwrap();
+    }
+
+    #[test]
+    fn test_once_blocked_default_infix() {
+        fn func(u: i32, cb: impl FnOnce(i32, i32) -> i32, v: i32) {
+            if cb(u + v, u * v) == 0i32 {
+                dbg!("Ok !");
+            } else {
+                panic!("Something wrong")
+            }
+        }
+        let ret = futures::executor::block_on(once_blocked!(func(2i32, ->(a, b) -> 0i32, 2 + 3)));
+        let (a, b) = *ret;
+        assert_eq!(7, a);
+        assert_eq!(10, b);
+    }
+
+    #[test]
+    fn test_once_blocked_default_infix_no_args() {
+        fn func(u: i32, cb: impl FnOnce(i32, i32) -> i32, v: i32) {
+            if cb(u + v, u * v) == 0i32 {
+                dbg!("Ok !");
+            } else {
+                panic!("Something wrong")
+            }
+        }
+        futures::executor::block_on(once_blocked!(func(2i32, ->(a, b) -> 0i32, 2 + 3)));
     }
 
     #[test]
