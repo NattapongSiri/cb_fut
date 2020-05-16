@@ -1,5 +1,5 @@
 # cb_fut
-This crate provide utility macros to convert a call to function that need a callback to handle return values into a function that either return a `Future` that resolve to values or a `Stream` that yield values. It introduce extra syntax `-> ()` into functional call signature.
+This crate provide utility macros to convert a call to function that need a callback to handle return values into a function that either return a `Future` that resolve to values or a `Stream` that yield values. It introduce extra syntax `-> ()` and `-> () ->` into macro call signature.
 
 ## Limitation
 Following are limitations of this crate.

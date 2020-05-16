@@ -1,7 +1,7 @@
 [package]
 name = "cb_fut"
 description = "Call function that return value via callback without a callback"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Nattapong Sirilappanich <nattapong.sirilappanich2@ibm.com>"]
 edition = "2018"
 license = "BSD-3-Clause"
