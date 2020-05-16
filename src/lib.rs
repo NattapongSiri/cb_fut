@@ -273,33 +273,39 @@ macro_rules! stream {
 
 /// Turn a function call that take a single callback and return nothing into a function call
 /// without callback but return an implementation of `futures::Stream` called 
-/// [CBStream](struct.CBStream.html).
+/// [CBStreamBlocked](struct.CBStreamBlocked.html).
 /// 
 /// If the callback will be called only once to return a value, consider using macro 
-/// [once](macro.once.html) instead.
+/// [once](macro.once.html) or [once_blocked](macro.once_blocked.html) instead.
 /// 
 /// The function call signature need to have a placeholder for macro to identify a callback
 /// parameter. To make it reflect to typical Rust syntax, the callback placeholder is
-/// `->(a)` for a callback that take single parameter. The reason to choose `(a)` instead of
+/// `->(a)->b` for a callback that take single parameter. The reason to choose `(a)` instead of
 /// `|a|` is because the return Future from this macro will return a `(a)` tuple thus 
 /// `->(a)` just like regular function return signature but with identifier instead of type.
+/// the extra `->b` designate the default return expression. It will be automatically call 
+/// when the generated result is dropped. If caller want to return different value,
+/// it can be done by call method [return_value](struct.CBStreamBlocked.html#method.return_value).
+/// It will prevent the default return from return value twice.
 /// 
 /// Example usecase:
 /// ```rust
 /// use futures::stream::StreamExt;
-/// fn func(u: i32, mut cb: impl FnMut(i32, i32), v: i32) {
-///     for i in 0..5 {
-///         cb(u + i, v * i)
+/// fn func(u: i32, mut cb: impl FnMut(i32, i32)->i32, v: i32) {
+///     let mut j = 0;
+///     while j < 5 {
+///         j = cb(u + j, v * j)
 ///     }
 /// }
 /// let mut counter = 0;
 /// 
-/// futures::executor::block_on(cb_fut::stream!(func(2 * 3, ->(a, b), 2 + 3)).enumerate().for_each(|(i, fut)| {
+/// futures::executor::block_on(cb_fut::stream_blocked!(func(2 * 3, ->(a, b)->0i32, 2 + 3)).enumerate().for_each(|(i, mut fut)| {
 ///     counter += 1;
 ///     async move {
-///         let (a, b) = fut;
+///         let (a, b) = *fut;
 ///         assert_eq!(2 * 3 + i as i32, a);
 ///         assert_eq!((2 + 3) * i as i32, b);
+///         fut.return_value(i as i32 + 1);
 ///     }
 /// }));
 /// ```
