@@ -11,6 +11,39 @@
 //! - If the function also return value, the returned value will be silently dropped.
 //! - If the function take multiple callbacks to return value on different circumstance, don't use these two macros.
 //! 
+//! # How to use
+//! This library depends on `Future` version 0.3.x. 
+//! In `cargo.toml` dependencies, add following lines.
+//! ```toml
+//! [dependencies]
+//! futures = "^0.3"
+//! cb_fut = "^0.2"
+//! ```
+//! This will use this library where the function redirect a variable from callback
+//! to future using `futures::channel::mpsc::UnboundedSender` while on the future side,
+//! it will be waiting for value from `futures::channel::mpsc::UnboundedReceiver`.
+//! For blocked style, inside the future, it will use `std::sync::mpsc::Sender` to send
+//! control variable back to function which is blocked by `std::sync::mpsc::Reciever`.
+//! To switch from Rust standard channel to crossbeam-channel, replace `cb_fut = "^0.2"`
+//! line in your `cargo.toml` dependencies with `cb_fut = {version = "^0.2", features = ["crossbeam"]}`.
+//! Your cargo.toml shall look like this:
+//! ```toml
+//! [dependencies]
+//! futures = "^0.3"
+//! cb_fut = {version = "^0.2", features = ["crossbeam"]}
+//! ```
+//! Now, future will return control variable to function using `crossbeam_channel::Sender` and
+//! the function is now blocked by `crossbeam_channel::Receiver`. You don't have to change
+//! anything else in your code.
+//! 
+//! Now you can use these [macros](#macros)
+//! 
+//! ## Why crossbeam-channel ?
+//! Because it is fast. See crossbeam-channel benchmark 
+//! [here](https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-channel/benchmarks).
+//! User shall decide whether it is actually help improve their own code performance as
+//! it depends on many more factors.
+//! 
 //! # What's new in version 0.2.0
 //! - [once_blocked](macro.once_blocked.html) - which let user return value to function.
 //! - [stream_blocked](macro.stream_blocked.html) - which let user return value to Stream.
